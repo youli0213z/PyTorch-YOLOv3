@@ -2,7 +2,7 @@
 
 def parse_model_config(path):
     """Parses the yolo-v3 layer configuration file and returns module definitions"""
-    file = open(path, 'r')
+    file = open(path, 'r',encoding='utf-8')
     lines = file.read().split('\n')
     lines = [x for x in lines if x and not x.startswith('#')]
     lines = [x.rstrip().lstrip() for x in lines]  # get rid of fringe whitespaces

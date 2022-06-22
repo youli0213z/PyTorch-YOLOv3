@@ -15,6 +15,7 @@ from pytorchyolo.utils.logger import Logger
 from pytorchyolo.utils.utils import to_cpu, load_classes, print_environment_info, provide_determinism, worker_seed_set
 from pytorchyolo.utils.datasets import ListDataset
 from pytorchyolo.utils.augmentations import AUGMENTATION_TRANSFORMS
+from pytorchyolo.utils.loss import _compute_loss
 #from pytorchyolo.utils.transforms import DEFAULT_TRANSFORMS
 from pytorchyolo.utils.parse_config import parse_data_config
 from pytorchyolo.utils.loss import compute_loss
@@ -162,7 +163,7 @@ def run():
 
             outputs = model(imgs)
 
-            loss, loss_components = compute_loss(outputs, targets, model)
+            loss, loss_components = _compute_loss(outputs, targets, model)
 
             loss.backward()
 

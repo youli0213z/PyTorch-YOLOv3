@@ -1,6 +1,7 @@
 from __future__ import division
 from itertools import chain
 import os
+import warnings
 
 import torch
 import torch.nn as nn
@@ -36,10 +37,12 @@ def create_modules(module_defs):
         "Height and width should be equal! Non square images are padded with zeros."
     output_filters = [hyperparams["channels"]]
     module_list = nn.ModuleList()
+    layers_list = []
     for module_i, module_def in enumerate(module_defs):
         modules = nn.Sequential()
 
         if module_def["type"] == "convolutional":
+            layers_list.append("convolutional")
             bn = int(module_def["batch_normalize"])
             filters = int(module_def["filters"])
             kernel_size = int(module_def["size"])
@@ -62,8 +65,38 @@ def create_modules(module_defs):
                 modules.add_module(f"leaky_{module_i}", nn.LeakyReLU(0.1))
             if module_def["activation"] == "mish":
                 modules.add_module(f"mish_{module_i}", Mish())
+            output_filters.append(filters)
+        elif module_def["type"] == 'ConvSet':
+            layers_list.append('ConvSet')
+            filters = int(module_def["filters"])
+            modules.add_module(f"ConvSet_{module_i}",
+                               ConvSet(in_channels=output_filters[-1], out_channels=filters,
+                                        activation=module_def["activation"]))
+            output_filters.append(filters)
+        elif module_def["type"] == 'ConvBlock':
+            layers_list.append('ConvBlock')
+            filters = int(module_def["filters"])
+            modules.add_module(f"ConvBlock_{module_i}",
+                               ConvBlock(in_channels=output_filters[-1], out_channels=filters,
+                                        activation=module_def["activation"]))
+            output_filters.append(filters)
+        elif module_def["type"] == 'ResBlock':
+            layers_list.append('ResBlock')
+            filters_list = eval(module_def["filters_list"])
+            ResBlock_num = int(module_def["ResBlock_num"])
+            for i in range(ResBlock_num):
+                modules.add_module(f"ResBlock_{module_i}_{i}", ResBlock(in_channels = output_filters[-1], out_channels_list=filters_list,activation=module_def["activation"]))
+            output_filters.append(filters_list[1])
+        elif module_def["type"] == "SPPF":
+            layers_list.append("SPPF")
+            kernel_size = int(module_def["size"])
+            stride = int(module_def["stride"])
+            modules.add_module(f"SPPF_{module_i}",SPPF(kernel_size=kernel_size,stride=stride,padding=kernel_size // 2)),
+            filters = int(module_def["filters"])
+            output_filters.append(filters)
 
         elif module_def["type"] == "maxpool":
+            layers_list.append("maxpool")
             kernel_size = int(module_def["size"])
             stride = int(module_def["stride"])
             if kernel_size == 2 and stride == 1:
@@ -73,19 +106,28 @@ def create_modules(module_defs):
             modules.add_module(f"maxpool_{module_i}", maxpool)
 
         elif module_def["type"] == "upsample":
+            layers_list.append("upsample")
             upsample = Upsample(scale_factor=int(module_def["stride"]), mode="nearest")
             modules.add_module(f"upsample_{module_i}", upsample)
+            filters = output_filters[-1]
+            output_filters.append(filters)
 
-        elif module_def["type"] == "route":
-            layers = [int(x) for x in module_def["layers"].split(",")]
-            filters = sum([output_filters[1:][i] for i in layers]) // int(module_def.get("groups", 1))
-            modules.add_module(f"route_{module_i}", nn.Sequential())
+        elif module_def["type"] == "Concat":
+            layer_index = eval(module_def['layers'])
+            filters = output_filters[layer_index[0]] + output_filters[layer_index[1]]
+            layers_list.append("Concat")
+            output_filters.append(filters)
+            modules.add_module(f"Concat_{module_i}", Concat(layer_index))
+            # layers = [int(x) for x in module_def["layers"].split(",")]
+            # filters = sum([output_filters[1:][i] for i in layers]) // int(module_def.get("groups", 1))
+            # modules.add_module(f"concatenate_{module_i}", nn.Sequential())
 
-        elif module_def["type"] == "shortcut":
-            filters = output_filters[1:][int(module_def["from"])]
-            modules.add_module(f"shortcut_{module_i}", nn.Sequential())
+        # elif module_def["type"] == "shortcut":
+        #     filters = output_filters[1:][int(module_def["from"])]
+        #     modules.add_module(f"shortcut_{module_i}", nn.Sequential())
 
         elif module_def["type"] == "yolo":
+            layers_list.append("yolo")
             anchor_idxs = [int(x) for x in module_def["mask"].split(",")]
             # Extract anchors
             anchors = [int(x) for x in module_def["anchors"].split(",")]
@@ -95,12 +137,155 @@ def create_modules(module_defs):
             # Define detection layer
             yolo_layer = YOLOLayer(anchors, num_classes)
             modules.add_module(f"yolo_{module_i}", yolo_layer)
+            output_filters.pop()
+            output_filters.pop()
         # Register module list and number of output filters
         module_list.append(modules)
-        output_filters.append(filters)
+        #output_filters.append(filters)
 
-    return hyperparams, module_list
+    return hyperparams, module_list,layers_list
 
+#concat
+class Concat(nn.Module):
+    def __init__(self,layer_index):
+        super(Concat,self).__init__()
+        self.layer_index = layer_index
+
+    def forward(self,layer_outputs):
+        a = layer_outputs[self.layer_index[0]]
+        b = layer_outputs[self.layer_index[1]]
+        c = torch.cat((a,b), dim=1)
+        #output = [layer_outputs[layer_i] for layer_i in self.layer_index]
+        return c
+
+
+
+
+
+#3个卷积模块
+class ConvBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, activation):
+        super(ConvBlock, self).__init__()
+        mid_channels = out_channels * 2
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1, padding=0, bias=False)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        if activation == 'leaky':
+            self.relu = nn.LeakyReLU(0.1)
+        elif activation == 'silu':
+            self.relu = nn.SiLU
+        elif activation == 'mish':
+            self.relu = Mish()
+        self.conv2 = nn.Conv2d(out_channels, mid_channels, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(mid_channels)
+
+        self.conv3 = nn.Conv2d(mid_channels, out_channels, kernel_size=1, stride=1, padding=0, bias=False)
+        self.bn3 = nn.BatchNorm2d(out_channels)
+
+    def forward(self, x):
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+        out = self.relu(out)
+
+        out = self.conv3(out)
+        out = self.bn3(out)
+        out = self.relu(out)
+        return out
+
+#5个卷积模块
+class ConvSet(nn.Module):
+    def __init__(self, in_channels, out_channels, activation):
+        mid_channels = out_channels * 2
+        super(ConvSet, self).__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1, padding=0, bias=False)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        if activation == 'leaky':
+            self.relu = nn.LeakyReLU(0.1)
+        elif activation == 'silu':
+            self.relu = nn.SiLU
+        elif activation == 'mish':
+            self.relu = Mish()
+        self.conv2 = nn.Conv2d(out_channels, mid_channels, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(mid_channels)
+
+        self.conv3 = nn.Conv2d(mid_channels, out_channels, kernel_size=1, stride=1, padding=0, bias=False)
+        self.bn3 = nn.BatchNorm2d(out_channels)
+
+        self.conv4 = nn.Conv2d(out_channels, mid_channels, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn4 = nn.BatchNorm2d(mid_channels)
+
+        self.conv5 = nn.Conv2d(mid_channels, out_channels, kernel_size=1, stride=1, padding=0, bias=False)
+        self.bn5 = nn.BatchNorm2d(out_channels)
+
+    def forward(self, x):
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+        out = self.relu(out)
+
+        out = self.conv3(out)
+        out = self.bn3(out)
+        out = self.relu(out)
+
+        out = self.conv4(out)
+        out = self.bn4(out)
+        out = self.relu(out)
+
+        out = self.conv5(out)
+        out = self.bn5(out)
+        out = self.relu(out)
+        return out
+
+#残差卷积模块
+class ResBlock(nn.Module):
+    def __init__(self, in_channels, out_channels_list, activation):
+        super(ResBlock, self).__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels_list[0], kernel_size=1, stride=1, padding=0, bias=False)
+        self.bn1 = nn.BatchNorm2d(out_channels_list[0])
+        if activation == 'leaky':
+            self.relu = nn.LeakyReLU(0.1)
+        elif activation == 'silu':
+            self.relu = nn.SiLU
+        elif activation == 'mish':
+            self.relu = Mish()
+
+        self.conv2 = nn.Conv2d(out_channels_list[0], out_channels_list[1], kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(out_channels_list[1])
+
+
+    def forward(self, x):
+        residual = x
+
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+        out = self.relu(out)
+
+        out += residual
+        return out
+
+class SPPF(nn.Module):
+    # Spatial Pyramid Pooling - Fast (SPPF) layer for  by Glenn Jocher
+    def __init__(self,kernel_size = 5,stride = 1,padding = 2):  # equivalent to SPP(k=(5, 9, 13))
+        super(SPPF,self).__init__()
+        padding = kernel_size // 2
+        self.m = nn.MaxPool2d(kernel_size=kernel_size, stride=stride, padding=padding)
+
+    def forward(self, x):
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore')  # suppress torch 1.9.0 max_pool2d() warning
+            y1 = self.m(x)
+            y2 = self.m(y1)
+            return torch.cat([x, y1, y2, self.m(y2)], 1)
 
 class Upsample(nn.Module):
     """ nn.Upsample is deprecated """
@@ -145,7 +330,7 @@ class YOLOLayer(nn.Module):
         stride = img_size // x.size(2)
         self.stride = stride
         bs, _, ny, nx = x.shape  # x(bs,255,20,20) to x(bs,3,20,20,85)
-        x = x.view(bs, self.num_anchors, self.no, ny, nx).permute(0, 1, 3, 4, 2).contiguous()
+        x = x.view(bs, -1, self.no, ny, nx).permute(0, 1, 3, 4, 2).contiguous()
 
         if not self.training:  # inference
             if self.grid.shape[2:4] != x.shape[2:4]:
@@ -160,7 +345,7 @@ class YOLOLayer(nn.Module):
 
     @staticmethod
     def _make_grid(nx=20, ny=20):
-        yv, xv = torch.meshgrid([torch.arange(ny), torch.arange(nx)], indexing='ij')
+        yv, xv = torch.meshgrid([torch.arange(ny), torch.arange(nx)])
         return torch.stack((xv, yv), 2).view((1, 1, ny, nx, 2)).float()
 
 
@@ -170,7 +355,7 @@ class Darknet(nn.Module):
     def __init__(self, config_path):
         super(Darknet, self).__init__()
         self.module_defs = parse_model_config(config_path)
-        self.hyperparams, self.module_list = create_modules(self.module_defs)
+        self.hyperparams, self.module_list ,self.layers_list = create_modules(self.module_defs)
         self.yolo_layers = [layer[0]
                             for layer in self.module_list if isinstance(layer[0], YOLOLayer)]
         self.seen = 0
@@ -179,21 +364,30 @@ class Darknet(nn.Module):
     def forward(self, x):
         img_size = x.size(2)
         layer_outputs, yolo_outputs = [], []
-        for i, (module_def, module) in enumerate(zip(self.module_defs, self.module_list)):
-            if module_def["type"] in ["convolutional", "upsample", "maxpool"]:
+        for i, (layer, module) in enumerate(zip(self.layers_list, self.module_list)):
+            if layer in ["convolutional",'ConvSet','ConvBlock','ResBlock','SPPF', "upsample", "maxpool"]:
                 x = module(x)
-            elif module_def["type"] == "route":
-                combined_outputs = torch.cat([layer_outputs[int(layer_i)] for layer_i in module_def["layers"].split(",")], 1)
-                group_size = combined_outputs.shape[1] // int(module_def.get("groups", 1))
-                group_id = int(module_def.get("group_id", 0))
-                x = combined_outputs[:, group_size * group_id : group_size * (group_id + 1)] # Slice groupings used by yolo v4
-            elif module_def["type"] == "shortcut":
-                layer_i = int(module_def["from"])
-                x = layer_outputs[-1] + layer_outputs[layer_i]
-            elif module_def["type"] == "yolo":
+                layer_outputs.append(x)
+            elif layer == "Concat":
+                #x = torch.cat(layer_outputs[module.layer_index[0]],layer_outputs[module.layer_index[1]])
+                a = layer_outputs[module[0].layer_index[0]]
+                b = layer_outputs[module[0].layer_index[1]]
+                x = torch.cat((a,b),dim = 1)
+                layer_outputs.append(x)
+                # combined_outputs = torch.cat([layer_outputs[int(layer_i)] for layer_i in module_def["layers"].split(",")], 1)
+                # group_size = combined_outputs.shape[1] // int(module_def.get("groups", 1))
+                # group_id = int(module_def.get("group_id", 0))
+                # x = combined_outputs[:, group_size * group_id : group_size * (group_id + 1)] # Slice groupings used by yolo v4
+            # elif module_def["type"] == "shortcut":
+            #     layer_i = int(module_def["from"])
+            #     x = layer_outputs[-1] + layer_outputs[layer_i]
+            elif layer == "yolo":
                 x = module[0](x, img_size)
                 yolo_outputs.append(x)
-            layer_outputs.append(x)
+                layer_outputs.pop()
+                layer_outputs.pop()
+                x = layer_outputs[-1]
+            #layer_outputs.append(x)
         return yolo_outputs if self.training else torch.cat(yolo_outputs, 1)
 
     def load_darknet_weights(self, weights_path):
@@ -304,8 +498,16 @@ def load_model(model_path, weights_path=None):
     device = torch.device("cuda" if torch.cuda.is_available()
                           else "cpu")  # Select device for inference
     model = Darknet(model_path).to(device)
+    #模型初始化
+    for sm in model.module_list:
+        for bm in sm:
+            if isinstance(bm,nn.Conv2d):
+                nn.init.normal_(bm.weight.data, 0.0, 0.02)
+            elif isinstance(bm,nn.BatchNorm2d):
+                nn.init.normal_(bm.weight.data, 1.0, 0.02)
+                nn.init.constant_(bm.bias.data, 0.0)
 
-    model.apply(weights_init_normal)
+    #model.apply(weights_init_normal)
 
     # If pretrained weights are specified, start from checkpoint or weight file
     if weights_path:
